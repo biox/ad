@@ -152,6 +152,8 @@ pub struct Buffer {
     pub(crate) input_filter: Option<InputFilter>,
     pub(crate) tokenizer: Option<Tokenizer>,
     edit_log: EditLog,
+    /// The index of the first modified line in the buffer since last checked
+    pub(crate) modified_from: Option<usize>,
 }
 
 impl Buffer {
@@ -172,6 +174,7 @@ impl Buffer {
             edit_log: EditLog::default(),
             tokenizer,
             input_filter: None,
+            modified_from: None,
         })
     }
 
@@ -243,6 +246,7 @@ impl Buffer {
         self.edit_log.clear();
         self.dirty = false;
         self.last_save = SystemTime::now();
+        self.modified_from = Some(0);
 
         let n_lines = self.txt.len_lines();
         let n_bytes = self.txt.len();
@@ -269,6 +273,7 @@ impl Buffer {
             edit_log: Default::default(),
             tokenizer: None,
             input_filter: None,
+            modified_from: None,
         }
     }
 
@@ -286,6 +291,7 @@ impl Buffer {
             edit_log: EditLog::default(),
             tokenizer: None,
             input_filter: None,
+            modified_from: None,
         }
     }
 
@@ -311,6 +317,7 @@ impl Buffer {
             edit_log: EditLog::default(),
             tokenizer: None,
             input_filter: None,
+            modified_from: None,
         }
     }
 
@@ -329,6 +336,7 @@ impl Buffer {
             edit_log: EditLog::default(),
             tokenizer: None,
             input_filter: None,
+            modified_from: None,
         }
     }
 
@@ -480,6 +488,26 @@ impl Buffer {
         }
     }
 
+    pub(crate) fn set_modified_from_dot(&mut self, dot: Dot) {
+        self.set_modified_from(self.first_dot_line(dot));
+    }
+
+    #[inline]
+    fn set_modified_from(&mut self, idx: usize) {
+        match self.modified_from.as_mut() {
+            Some(i) if *i <= idx => (),
+            Some(i) => *i = idx,
+            None => self.modified_from = Some(idx),
+        }
+    }
+
+    #[inline]
+    fn first_dot_line(&self, dot: Dot) -> usize {
+        self.txt
+            .try_char_to_line(dot.first_cur().idx)
+            .unwrap_or_else(|| self.txt.len_lines() - 1)
+    }
+
     /// Attempt to expand from the given cursor position so long as either the previous or next
     /// character in the buffer is a known delimiter.
     pub(crate) fn try_expand_delimited(&mut self) {
@@ -523,6 +551,7 @@ impl Buffer {
 
         if let Some(dot) = self.try_expand_known(current_index) {
             self.dot = dot;
+            self.set_modified_from(self.first_dot_line(self.dot));
             return;
         }
 
@@ -543,6 +572,7 @@ impl Buffer {
         }
 
         self.dot = Dot::from_char_indices(from, to);
+        self.set_modified_from(self.first_dot_line(self.dot));
     }
 
     /// Try to be smart about expanding from the current cursor position to something that we
@@ -648,6 +678,7 @@ impl Buffer {
     }
 
     pub(crate) fn append(&mut self, s: String, source: Source) {
+        self.set_modified_from(self.first_dot_line(self.dot));
         let dot = self.dot;
         self.set_dot(TextObject::BufferEnd, 1);
         self.handle_action(Action::InsertString { s }, source);
@@ -754,15 +785,18 @@ impl Buffer {
 
     /// Set dot and clamp to ensure it is within bounds
     pub(crate) fn set_dot(&mut self, t: TextObject, n: usize) {
+        self.set_modified_from(self.first_dot_line(self.dot));
         for _ in 0..n {
             t.set_dot(self);
         }
         self.dot.clamp_idx(self.txt.len_chars());
         self.xdot.clamp_idx(self.txt.len_chars());
+        self.set_modified_from(self.first_dot_line(self.dot));
     }
 
     /// Extend dot foward and clamp to ensure it is within bounds
     fn extend_dot_forward(&mut self, t: TextObject, n: usize) {
+        self.set_modified_from(self.first_dot_line(self.dot));
         for _ in 0..n {
             t.extend_dot_forward(self);
         }
@@ -772,6 +806,7 @@ impl Buffer {
 
     /// Extend dot backward and clamp to ensure it is within bounds
     fn extend_dot_backward(&mut self, t: TextObject, n: usize) {
+        self.set_modified_from(self.first_dot_line(self.dot));
         for _ in 0..n {
             t.extend_dot_backward(self);
         }
@@ -872,6 +907,9 @@ impl Buffer {
     }
 
     fn insert_char(&mut self, dot: Dot, ch: char, source: Option<Source>) -> (Cur, Option<String>) {
+        self.set_modified_from(self.first_dot_line(self.dot));
+        self.set_modified_from(self.first_dot_line(dot));
+
         let ch = if ch == '\r' { '\n' } else { ch };
         let (cur, deleted) = match dot {
             Dot::Cur { c } => (c, None),
@@ -897,6 +935,9 @@ impl Buffer {
         s: String,
         source: Option<Source>,
     ) -> (Cur, Option<String>) {
+        self.set_modified_from(self.first_dot_line(self.dot));
+        self.set_modified_from(self.first_dot_line(dot));
+
         let s = normalize_line_endings(s);
         let (mut cur, deleted) = match dot {
             Dot::Cur { c } => (c, None),
@@ -925,6 +966,9 @@ impl Buffer {
     }
 
     fn delete_dot(&mut self, dot: Dot, source: Option<Source>) -> (Cur, Option<String>) {
+        self.set_modified_from(self.first_dot_line(self.dot));
+        self.set_modified_from(self.first_dot_line(dot));
+
         let (cur, deleted) = match dot {
             Dot::Cur { c } => (self.delete_cur(c, source), None),
             Dot::Range { r } => self.delete_range(r, source),
@@ -971,8 +1015,11 @@ impl Buffer {
     }
 
     pub(crate) fn find_forward(&mut self, s: &str) {
+        self.set_modified_from(self.first_dot_line(self.dot));
+
         if let Some(dot) = find_forward_wrapping(&s, self) {
             self.dot = dot;
+            self.set_modified_from(self.first_dot_line(self.dot));
         }
     }
 }

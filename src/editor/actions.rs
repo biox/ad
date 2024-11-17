@@ -164,7 +164,7 @@ where
         let was_empty_scratch = self.layout.is_empty_scratch();
         let current_id = self.active_buffer_id();
 
-        match self.layout.open_or_focus(path, new_window) {
+        match self.layout.open_or_focus(path, &mut self.ui, new_window) {
             Err(e) => self.set_status_message(&format!("Error opening file: {e}")),
 
             Ok(Some(new_id)) => {
@@ -260,6 +260,9 @@ where
                 self.clear_input_filter(id);
                 let was_last_buffer = self.layout.close_buffer(id);
                 self.running = !was_last_buffer;
+                self.ui.state_change(StateChange::WindowsResized {
+                    winids: self.layout.visible_winids().collect(),
+                });
             }
         }
     }
@@ -269,6 +272,9 @@ where
         if is_last_window {
             self.exit(force);
         }
+        self.ui.state_change(StateChange::WindowsResized {
+            winids: self.layout.visible_winids().collect(),
+        });
     }
 
     pub(crate) fn delete_active_column(&mut self, force: bool) {
@@ -276,6 +282,9 @@ where
         if is_last_column {
             self.exit(force);
         }
+        self.ui.state_change(StateChange::WindowsResized {
+            winids: self.layout.visible_winids().collect(),
+        });
     }
 
     pub(crate) fn mark_clean(&mut self, bufid: usize) {
@@ -456,7 +465,7 @@ where
     }
 
     pub(super) fn focus_buffer(&mut self, id: usize) {
-        self.layout.focus_id(id);
+        self.layout.focus_id(id, &mut self.ui);
         _ = self.tx_fsys.send(LogEvent::Focus(id));
     }
 
@@ -474,11 +483,12 @@ where
 
     pub(super) fn view_logs(&mut self) {
         self.layout
-            .open_virtual("+logs", self.log_buffer.content(), false)
+            .open_virtual("+logs", self.log_buffer.content(), &mut self.ui, false)
     }
 
     pub(super) fn show_help(&mut self) {
-        self.layout.open_virtual("+help", gen_help_docs(), false)
+        self.layout
+            .open_virtual("+help", gen_help_docs(), &mut self.ui, false)
     }
 
     pub(super) fn debug_edit_log(&mut self) {
@@ -569,7 +579,8 @@ where
                     .get("filename")
                     .cloned()
                     .unwrap_or_else(|| "+plumbing-message".to_string());
-                self.layout.open_virtual(filename, data, load_in_new_window);
+                self.layout
+                    .open_virtual(filename, data, &mut self.ui, load_in_new_window);
             }
 
             _ => {
@@ -630,7 +641,11 @@ where
             if let Some(mut addr) = maybe_addr {
                 let b = self.layout.active_buffer_mut();
                 b.dot = b.map_addr(&mut addr);
-                self.layout.clamp_scroll();
+                if self.layout.clamp_scroll() {
+                    let winid = self.layout.active_window_id();
+                    self.ui
+                        .state_change(StateChange::WindowBufferChanged { winid });
+                }
                 self.handle_action(Action::SetViewPort(ViewPort::Center), Source::Fsys);
             }
         } else {
@@ -721,7 +736,8 @@ where
                 }
             };
             let id = self.active_buffer_id();
-            self.layout.write_output_for_buffer(id, s, &self.cwd);
+            self.layout
+                .write_output_for_buffer(id, s, &self.cwd, &mut self.ui);
         }
     }
 

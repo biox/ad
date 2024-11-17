@@ -21,9 +21,12 @@ use crate::{
     ziplist, ORIGINAL_TERMIOS, VERSION,
 };
 use std::{
+    cell::RefCell,
     cmp::min,
+    collections::BTreeMap,
     io::{stdin, stdout, Read, Stdin, Stdout, Write},
     panic,
+    rc::Rc,
     sync::mpsc::Sender,
     thread::{spawn, JoinHandle},
     time::Instant,
@@ -40,8 +43,12 @@ fn box_draw_str(s: &str, cs: &ColorScheme) -> String {
     format!("{}{}{s}", Style::Fg(cs.minibuffer_hl), Style::Bg(cs.bg))
 }
 
+/// winid -> line -> cached render
+type RenderCache = Rc<RefCell<BTreeMap<usize, BTreeMap<usize, String>>>>;
+
 #[derive(Debug)]
 pub struct Tui {
+    render_cache: RenderCache,
     stdout: Stdout,
     screen_rows: usize,
     screen_cols: usize,
@@ -69,6 +76,7 @@ impl Drop for Tui {
 impl Tui {
     pub fn new() -> Self {
         let mut tui = Self {
+            render_cache: Default::default(),
             stdout: stdout(),
             screen_rows: 0,
             screen_cols: 0,
@@ -94,6 +102,16 @@ impl Tui {
         self.hvh = format!("{hstr}{vstr}{hstr}");
         self.vh = format!("{vstr}{hstr}");
         self.vstr = vstr;
+    }
+
+    fn clear_render_cache_for_window(&mut self, winid: usize) {
+        self.render_cache.borrow_mut().remove(&winid);
+    }
+
+    fn clear_render_cache_from_line(&mut self, winid: usize, from: usize) {
+        if let Some(cache) = self.render_cache.borrow_mut().get_mut(&winid) {
+            cache.retain(|&k, _| k < from);
+        }
     }
 
     fn render_banner(&self, screen_rows: usize, cs: &ColorScheme) -> Vec<String> {
@@ -275,22 +293,30 @@ impl UserInterface for Tui {
                 self.status_message = msg;
                 self.last_status = Instant::now();
             }
+            StateChange::WindowBufferChanged { winid } => {
+                self.clear_render_cache_for_window(winid);
+            }
+            StateChange::WindowsResized { winids } => {
+                for id in winids {
+                    self.clear_render_cache_for_window(id);
+                }
+            }
         }
     }
 
     fn refresh(
         &mut self,
         mode_name: &str,
-        windows: &Layout,
+        layout: &Layout,
         pending_keys: &[Input],
         held_click: Option<&Click>,
         mb: Option<MiniBufferState<'_>>,
     ) {
-        self.screen_rows = windows.screen_rows;
-        self.screen_cols = windows.screen_cols;
+        self.screen_rows = layout.screen_rows;
+        self.screen_cols = layout.screen_cols;
         let w_minibuffer = mb.is_some();
         let mb = mb.unwrap_or_default();
-        let active_buffer = windows.active_buffer();
+        let active_buffer = layout.active_buffer();
         let mb_lines = mb.b.map(|b| b.len_lines()).unwrap_or_default();
         let mb_offset = if mb_lines > 0 { 1 } else { 0 };
 
@@ -315,11 +341,18 @@ impl UserInterface for Tui {
         let mut lines = Vec::with_capacity(self.screen_rows + 2);
         lines.push(format!("{}{}", Cursor::Hide, Cursor::ToStart));
 
-        if windows.is_empty_scratch() {
+        if layout.is_empty_scratch() {
             lines.append(&mut self.render_banner(effective_screen_rows, &cs));
         } else {
+            for w in layout.iter_windows() {
+                if let Some(b) = layout.buffer_with_id(w.view.bufid) {
+                    if let Some(idx) = b.modified_from {
+                        self.clear_render_cache_from_line(w.id, idx);
+                    }
+                }
+            }
             lines.extend(WinsIter::new(
-                windows,
+                layout,
                 load_exec_range,
                 effective_screen_rows,
                 self,
@@ -339,7 +372,7 @@ impl UserInterface for Tui {
         let (x, y) = if w_minibuffer {
             (mb.cx, self.screen_rows + mb.n_visible_lines + 1)
         } else {
-            windows.ui_xy(active_buffer)
+            layout.ui_xy(active_buffer)
         };
         lines.push(format!("{}{}", Cursor::To(x + 1, y + 1), Cursor::Show));
 
@@ -373,18 +406,18 @@ struct WinsIter<'a> {
 
 impl<'a> WinsIter<'a> {
     fn new(
-        windows: &'a Layout,
+        layout: &'a Layout,
         load_exec_range: Option<(bool, Range)>,
         screen_rows: usize,
-        tui: &'a Tui,
+        tui: &'a mut Tui,
         cs: &'a ColorScheme,
     ) -> Self {
-        let col_iters: Vec<_> = windows
+        let col_iters: Vec<_> = layout
             .cols
             .iter()
             .map(|(is_focus, col)| {
                 let rng = if is_focus { load_exec_range } else { None };
-                ColIter::new(col, windows, rng, screen_rows, cs)
+                ColIter::new(col, layout, rng, screen_rows, cs, tui.render_cache.clone())
             })
             .collect();
         let buf = Vec::with_capacity(col_iters.len());
@@ -422,31 +455,34 @@ impl<'a> Iterator for WinsIter<'a> {
 struct ColIter<'a> {
     inner: ziplist::Iter<'a, Window>,
     current: Option<WinIter<'a>>,
-    wins: &'a Layout,
+    layout: &'a Layout,
     cs: &'a ColorScheme,
     load_exec_range: Option<(bool, Range)>,
     screen_rows: usize,
     n_cols: usize,
     yielded: usize,
+    render_cache: RenderCache,
 }
 
 impl<'a> ColIter<'a> {
     fn new(
         col: &'a Column,
-        wins: &'a Layout,
+        layout: &'a Layout,
         load_exec_range: Option<(bool, Range)>,
         screen_rows: usize,
         cs: &'a ColorScheme,
+        render_cache: RenderCache,
     ) -> Self {
         ColIter {
             inner: col.wins.iter(),
             current: None,
-            wins,
+            layout,
             cs,
             load_exec_range,
             screen_rows,
             n_cols: col.n_cols,
             yielded: 0,
+            render_cache,
         }
     }
 }
@@ -455,7 +491,7 @@ impl<'a> ColIter<'a> {
     fn next_win_iter(&mut self) -> Option<WinIter<'a>> {
         let (is_focus, w) = self.inner.next()?;
         let b = self
-            .wins
+            .layout
             .buffer_with_id(w.view.bufid)
             .expect("valid buffer id");
 
@@ -470,6 +506,7 @@ impl<'a> ColIter<'a> {
             w,
             cs: self.cs,
             load_exec_range: rng,
+            render_cache: self.render_cache.clone(),
         })
     }
 }
@@ -506,6 +543,7 @@ struct WinIter<'a> {
     w: &'a Window,
     cs: &'a ColorScheme,
     load_exec_range: Option<(bool, Range)>,
+    render_cache: RenderCache,
 }
 
 impl<'a> Iterator for WinIter<'a> {
@@ -517,6 +555,12 @@ impl<'a> Iterator for WinIter<'a> {
         }
         let file_row = self.y + self.w.view.row_off;
         self.y += 1;
+
+        if let Some(cache) = self.render_cache.borrow_mut().get(&self.w.id) {
+            if let Some(line) = cache.get(&file_row) {
+                return Some(line.clone());
+            }
+        }
 
         let line = if file_row >= self.b.len_lines() {
             let mut buf = format!(
@@ -552,6 +596,12 @@ impl<'a> Iterator for WinIter<'a> {
                 width = self.w_lnum
             )
         };
+
+        self.render_cache
+            .borrow_mut()
+            .entry(self.w.id)
+            .or_default()
+            .insert(file_row, line.clone());
 
         Some(line)
     }
@@ -602,7 +652,7 @@ fn num_cols(chars: &[char]) -> usize {
 /// This includes tab expansion but not any styling that might be applied,
 /// trailing \r\n or screen clearing escape codes.
 /// If a dot range is provided then the character offsets used will be adjusted
-/// to account for expanded tab characters, returning None if self.col_off would
+/// to account for expanded tab characters, returning None if view.col_off would
 /// mean that the requested range is not currently visible.
 fn raw_rline_unchecked(
     b: &Buffer,

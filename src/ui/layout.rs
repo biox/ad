@@ -3,7 +3,9 @@ use crate::{
     buffer::{Buffer, BufferId, Buffers},
     config_handle,
     dot::{Cur, Dot},
-    editor::ViewPort,
+    editor::{Click, MiniBufferState, ViewPort},
+    key::Input,
+    ui::{StateChange, Ui, UserInterface},
     ziplist,
     ziplist::{Position, ZipList},
 };
@@ -25,20 +27,40 @@ pub(crate) struct Layout {
     pub(super) cols: ZipList<Column>,
     /// Known Buffer views that are not currently active
     pub(super) views: Vec<View>,
+    next_winid: usize,
 }
 
 impl Layout {
     pub(crate) fn new(screen_rows: usize, screen_cols: usize) -> Self {
         let buffers = Buffers::new();
         let id = buffers.active().id;
+        let mut next_winid = 0;
 
         Self {
             buffers,
             screen_rows,
             screen_cols,
-            cols: ziplist![Column::new(screen_rows, screen_cols, &[id])],
+            cols: ziplist![Column::new(
+                screen_rows,
+                screen_cols,
+                &[id],
+                &mut next_winid
+            )],
             views: vec![],
+            next_winid,
         }
+    }
+
+    pub(crate) fn refresh_ui(
+        &mut self,
+        ui: &mut Ui,
+        mode_name: &str,
+        pending_keys: &[Input],
+        held_click: Option<&Click>,
+        mb: Option<MiniBufferState<'_>>,
+    ) {
+        ui.refresh(mode_name, self, pending_keys, held_click, mb);
+        self.clear_buffer_modified_from();
     }
 
     pub(crate) fn is_empty_scratch(&self) -> bool {
@@ -49,6 +71,10 @@ impl Layout {
         self.cols
             .iter()
             .any(|(_, c)| c.wins.iter().any(|(_, w)| w.view.bufid == id))
+    }
+
+    pub(crate) fn active_window_id(&self) -> usize {
+        self.cols.focus.wins.focus.id
     }
 
     pub(crate) fn active_buffer(&self) -> &Buffer {
@@ -67,6 +93,20 @@ impl Layout {
         self.buffers.with_id_mut(id)
     }
 
+    pub(crate) fn iter_windows(&self) -> impl Iterator<Item = &Window> {
+        self.cols
+            .iter()
+            .flat_map(|(_, col)| col.wins.iter().map(|(_, win)| win))
+    }
+
+    pub(crate) fn visible_winids(&self) -> impl Iterator<Item = usize> + '_ {
+        self.iter_windows().map(|win| win.id)
+    }
+
+    pub(crate) fn clear_buffer_modified_from(&mut self) {
+        self.buffers.clear_modified_from();
+    }
+
     fn focus_first_window_with_buffer(&mut self, id: BufferId) {
         self.cols
             .focus_element_by_mut(|c| c.wins.focus_element_by_mut(|w| w.view.bufid == id));
@@ -75,6 +115,7 @@ impl Layout {
     pub(crate) fn open_or_focus<P: AsRef<Path>>(
         &mut self,
         path: P,
+        ui: &mut Ui,
         mut new_window: bool,
     ) -> io::Result<Option<BufferId>> {
         if self.buffers.is_empty_scratch() {
@@ -91,7 +132,7 @@ impl Layout {
         } else if new_window {
             self.show_buffer_in_new_window(id);
         } else {
-            self.show_buffer_in_active_window(id);
+            self.show_buffer_in_active_window(id, ui);
         }
 
         Ok(opt)
@@ -104,13 +145,14 @@ impl Layout {
         &mut self,
         name: impl Into<String>,
         content: impl Into<String>,
+        ui: &mut Ui,
         load_in_new_window: bool,
     ) {
         self.buffers.open_virtual(name.into(), content.into());
         if load_in_new_window {
             self.show_buffer_in_new_window(self.active_buffer().id);
         } else {
-            self.show_buffer_in_active_window(self.active_buffer().id);
+            self.show_buffer_in_active_window(self.active_buffer().id, ui);
         }
     }
 
@@ -147,7 +189,8 @@ impl Layout {
             self.cols = ziplist![Column::new(
                 self.screen_rows,
                 self.screen_cols,
-                &[focused_id]
+                &[focused_id],
+                &mut self.next_winid,
             )];
             if let Some(view) = existing_view {
                 self.cols.focus.wins.focus.view = view;
@@ -170,12 +213,12 @@ impl Layout {
         false
     }
 
-    pub(crate) fn focus_id(&mut self, id: BufferId) {
+    pub(crate) fn focus_id(&mut self, id: BufferId, ui: &mut Ui) {
         if let Some(id) = self.buffers.focus_id(id) {
             if self.buffer_is_visible(id) {
                 self.focus_first_window_with_buffer(id);
             } else {
-                self.show_buffer_in_active_window(id);
+                self.show_buffer_in_active_window(id, ui);
             }
         }
     }
@@ -185,18 +228,18 @@ impl Layout {
         self.buffers.focus_id_silent(id);
     }
 
-    pub(crate) fn focus_next_buffer(&mut self) -> BufferId {
+    pub(crate) fn focus_next_buffer(&mut self, ui: &mut Ui) -> BufferId {
         self.buffers.next();
         let id = self.active_buffer().id;
-        self.show_buffer_in_active_window(id);
+        self.show_buffer_in_active_window(id, ui);
 
         id
     }
 
-    pub(crate) fn focus_previous_buffer(&mut self) -> BufferId {
+    pub(crate) fn focus_previous_buffer(&mut self, ui: &mut Ui) -> BufferId {
         self.buffers.previous();
         let id = self.active_buffer().id;
-        self.show_buffer_in_active_window(id);
+        self.show_buffer_in_active_window(id, ui);
 
         id
     }
@@ -242,10 +285,10 @@ impl Layout {
         self.buffers.as_buffer_list()
     }
 
-    pub(crate) fn jump_forward(&mut self) -> Option<BufferId> {
+    pub(crate) fn jump_forward(&mut self, ui: &mut Ui) -> Option<BufferId> {
         let maybe_ids = self.buffers.jump_list_forward();
         if let Some((prev_id, new_id)) = maybe_ids {
-            self.show_buffer_in_active_window(self.active_buffer().id);
+            self.show_buffer_in_active_window(self.active_buffer().id, ui);
             self.set_viewport(ViewPort::Center);
             if new_id != prev_id {
                 return Some(new_id);
@@ -255,10 +298,10 @@ impl Layout {
         None
     }
 
-    pub(crate) fn jump_backward(&mut self) -> Option<BufferId> {
+    pub(crate) fn jump_backward(&mut self, ui: &mut Ui) -> Option<BufferId> {
         let maybe_ids = self.buffers.jump_list_backward();
         if let Some((prev_id, new_id)) = maybe_ids {
-            self.show_buffer_in_active_window(self.active_buffer().id);
+            self.show_buffer_in_active_window(self.active_buffer().id, ui);
             self.set_viewport(ViewPort::Center);
             if new_id != prev_id {
                 return Some(new_id);
@@ -268,12 +311,20 @@ impl Layout {
         None
     }
 
-    pub(crate) fn write_output_for_buffer(&mut self, id: usize, s: String, cwd: &Path) {
+    pub(crate) fn write_output_for_buffer(
+        &mut self,
+        id: usize,
+        s: String,
+        cwd: &Path,
+        ui: &mut Ui,
+    ) {
         let id = self.buffers.write_output_for_buffer(id, s, cwd);
         if !self.buffer_is_visible(id) {
+            let winid = self.cols.focus.wins.focus.id;
+            ui.state_change(StateChange::WindowBufferChanged { winid });
             self.show_buffer_in_new_window(id);
         } else {
-            self.show_buffer_in_active_window(id);
+            self.show_buffer_in_active_window(id, ui);
         }
     }
 
@@ -328,7 +379,12 @@ impl Layout {
                 return;
             }
             let win = self.cols.focus.wins.remove_focused_unchecked();
-            let mut col = Column::new(self.screen_rows, self.screen_cols, &[win.view.bufid]);
+            let mut col = Column::new(
+                self.screen_rows,
+                self.screen_cols,
+                &[win.view.bufid],
+                &mut 0,
+            );
             col.wins.focus = win;
             self.cols.insert_at(Position::Head, col);
             self.cols.focus_up();
@@ -356,7 +412,7 @@ impl Layout {
                 return;
             }
             let win = self.cols.focus.wins.remove_focused_unchecked();
-            let mut col = Column::new(self.screen_rows, self.screen_cols, &[0]);
+            let mut col = Column::new(self.screen_rows, self.screen_cols, &[0], &mut 0);
             col.wins.focus = win;
             self.cols.insert_at(Position::Tail, col);
             self.cols.focus_down();
@@ -403,14 +459,17 @@ impl Layout {
             col.update_size(rows, w);
         }
 
-        self.clamp_scroll();
+        _ = self.clamp_scroll();
     }
 
     /// Set the currently focused window to contain the given buffer
-    pub(crate) fn show_buffer_in_active_window(&mut self, id: BufferId) {
+    pub(crate) fn show_buffer_in_active_window(&mut self, id: BufferId, ui: &mut Ui) {
         if self.focused_view().bufid == id {
             return;
         }
+
+        let winid = self.cols.focus.wins.focus.id;
+        ui.state_change(StateChange::WindowBufferChanged { winid });
 
         let mut view = match self.views.iter().position(|v| v.bufid == id) {
             Some(idx) => self.views.remove(idx),
@@ -425,7 +484,12 @@ impl Layout {
     /// current active window.
     pub(crate) fn new_column(&mut self) {
         let view = self.focused_view().clone();
-        let mut col = Column::new(self.screen_rows, self.screen_cols, &[view.bufid]);
+        let mut col = Column::new(
+            self.screen_rows,
+            self.screen_cols,
+            &[view.bufid],
+            &mut self.next_winid,
+        );
         col.wins.last_mut().view = view;
         self.cols.insert_at(Position::Tail, col);
         self.cols.focus_tail();
@@ -437,8 +501,16 @@ impl Layout {
     pub(crate) fn new_window(&mut self) {
         let view = self.focused_view().clone();
         let wins = &mut self.cols.focus.wins;
-        wins.insert_at(Position::Tail, Window { n_rows: 0, view });
+        wins.insert_at(
+            Position::Tail,
+            Window {
+                id: self.next_winid,
+                n_rows: 0,
+                view,
+            },
+        );
         wins.focus_tail();
+        self.next_winid += 1;
         self.update_screen_size(self.screen_rows, self.screen_cols);
     }
 
@@ -454,13 +526,26 @@ impl Layout {
         };
 
         if self.cols.len() == 1 {
-            let mut col = Column::new(self.screen_rows, self.screen_cols, &[id]);
+            let mut col = Column::new(
+                self.screen_rows,
+                self.screen_cols,
+                &[id],
+                &mut self.next_winid,
+            );
             col.wins.last_mut().view = view;
             self.cols.insert_at(Position::Tail, col);
         } else {
             let wins = &mut self.cols.last_mut().wins;
-            wins.insert_at(Position::Tail, Window { n_rows: 0, view });
+            wins.insert_at(
+                Position::Tail,
+                Window {
+                    id: self.next_winid,
+                    n_rows: 0,
+                    view,
+                },
+            );
             wins.focus_tail();
+            self.next_winid += 1;
         }
 
         self.cols.focus_tail();
@@ -480,7 +565,7 @@ impl Layout {
         }
 
         view.row_off = view.row_off.saturating_sub(1);
-        view.clamp_scroll(b, rows, cols);
+        _ = view.clamp_scroll(b, rows, cols);
     }
 
     pub(crate) fn scroll_down(&mut self) {
@@ -498,10 +583,12 @@ impl Layout {
         }
 
         view.row_off += 1;
-        view.clamp_scroll(b, rows, cols);
+        _ = view.clamp_scroll(b, rows, cols);
     }
 
-    pub(crate) fn clamp_scroll(&mut self) {
+    /// Returns whether or not col_off was modified
+    #[must_use]
+    pub(crate) fn clamp_scroll(&mut self) -> bool {
         let b = self.buffers.active_mut();
         let cols = self.cols.focus.n_cols;
         let rows = self.cols.focus.wins.focus.n_rows;
@@ -509,7 +596,7 @@ impl Layout {
         self.cols
             .focus
             .focused_view_mut()
-            .clamp_scroll(b, rows, cols);
+            .clamp_scroll(b, rows, cols)
     }
 
     pub(crate) fn set_viewport(&mut self, vp: ViewPort) {
@@ -631,9 +718,14 @@ impl Layout {
     /// Returns true if the click was in the currently active buffer and false if this click has
     /// changed the active buffer.
     pub(crate) fn set_dot_from_screen_coords(&mut self, x: usize, y: usize) -> bool {
+        let b = self.active_buffer_mut();
+        b.set_modified_from_dot(b.dot);
+
         let current_bufid = self.buffers.active().id;
         let (bufid, c) = self.cur_from_screen_coords(x, y, true);
-        self.buffers.active_mut().dot = Dot::Cur { c };
+        let b = self.buffers.active_mut();
+        b.dot = Dot::Cur { c };
+        b.set_modified_from_dot(b.dot);
 
         bufid == current_bufid
     }
@@ -648,13 +740,25 @@ pub(crate) struct Column {
 }
 
 impl Column {
-    pub(crate) fn new(n_rows: usize, n_cols: usize, buf_ids: &[BufferId]) -> Self {
+    pub(crate) fn new(
+        n_rows: usize,
+        n_cols: usize,
+        buf_ids: &[BufferId],
+        next_winid: &mut usize,
+    ) -> Self {
         if buf_ids.is_empty() {
             panic!("cant have an empty column");
         }
         let win_rows = n_rows / buf_ids.len();
-        let mut wins =
-            ZipList::try_from_iter(buf_ids.iter().map(|id| Window::new(win_rows, *id))).unwrap();
+        let mut wins = ZipList::try_from_iter(
+            buf_ids
+                .iter()
+                .enumerate()
+                .map(|(ix, id)| Window::new(*next_winid + ix, win_rows, *id)),
+        )
+        .unwrap();
+
+        *next_winid += wins.len();
 
         let slop = n_rows - (win_rows * buf_ids.len()) + buf_ids.len() - 1;
         wins.focus.n_rows += slop;
@@ -689,6 +793,8 @@ impl Column {
 
 #[derive(Debug, Clone)]
 pub(crate) struct Window {
+    /// A unique id for this window
+    pub(crate) id: usize,
     /// Number of character rows high
     pub(crate) n_rows: usize,
     /// Buffer view details currently shown in this window
@@ -696,8 +802,9 @@ pub(crate) struct Window {
 }
 
 impl Window {
-    pub(crate) fn new(n_rows: usize, bufid: BufferId) -> Self {
+    pub(crate) fn new(id: usize, n_rows: usize, bufid: BufferId) -> Self {
         Self {
+            id,
             n_rows,
             view: View::new(bufid),
         }
@@ -751,7 +858,15 @@ impl View {
     }
 
     /// Clamp the current viewport to include the [Dot].
-    pub(crate) fn clamp_scroll(&mut self, b: &mut Buffer, screen_rows: usize, screen_cols: usize) {
+    ///
+    /// Returns whether or not self.col_off has been modified.
+    #[must_use]
+    pub(crate) fn clamp_scroll(
+        &mut self,
+        b: &mut Buffer,
+        screen_rows: usize,
+        screen_cols: usize,
+    ) -> bool {
         let (y, x) = b.dot.active_cur().as_yx(b);
         let (_, w_sgncol) = b.sign_col_dims();
         self.rx = self.rx_from_x(b, y, x);
@@ -765,6 +880,8 @@ impl View {
             self.row_off = y - screen_rows + 1;
         }
 
+        let prev_col_off = self.col_off;
+
         if self.rx < self.col_off {
             self.col_off = self.rx;
         }
@@ -772,6 +889,8 @@ impl View {
         if self.rx >= self.col_off + screen_cols - w_sgncol {
             self.col_off = self.rx - screen_cols + w_sgncol + 1;
         }
+
+        self.col_off == prev_col_off
     }
 
     /// Set the current [ViewPort] while accounting for screen size.
@@ -790,7 +909,7 @@ impl View {
             ViewPort::Bottom => y.saturating_sub(screen_rows),
         };
 
-        self.clamp_scroll(b, screen_rows, screen_cols);
+        _ = self.clamp_scroll(b, screen_rows, screen_cols);
     }
 }
 
@@ -824,11 +943,12 @@ mod tests {
         let mut cols = Vec::with_capacity(col_wins.len());
         let mut n = 0;
         let mut all_ids = Vec::new();
+        let mut next_winid = 0;
 
         for m in col_wins.iter() {
             let ids: Vec<usize> = (n..(n + m)).collect();
             n += m;
-            cols.push(Column::new(n_rows, n_cols, &ids));
+            cols.push(Column::new(n_rows, n_cols, &ids, &mut next_winid));
             all_ids.extend(ids);
         }
 
@@ -838,6 +958,7 @@ mod tests {
             screen_cols: n_cols,
             cols: ZipList::try_from_iter(cols).unwrap(),
             views: vec![],
+            next_winid,
         };
         ws.update_screen_size(n_rows, n_cols);
 
@@ -1074,7 +1195,7 @@ mod tests {
             );
 
             b.set_dot(TextObject::Arr(Arrow::Right), 1);
-            view.clamp_scroll(&mut b, 80, 80);
+            _ = view.clamp_scroll(&mut b, 80, 80);
             offset += widths[idx];
         }
     }

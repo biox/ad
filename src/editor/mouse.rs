@@ -116,7 +116,11 @@ where
                     click.selection.set_active_cursor(cur);
 
                     if click.btn == Left {
-                        self.layout.active_buffer_mut().dot = Dot::from(click.selection);
+                        let dot = Dot::from(click.selection);
+                        let b = self.layout.active_buffer_mut();
+                        b.set_modified_from_dot(b.dot);
+                        b.set_modified_from_dot(dot);
+                        b.dot = dot;
                     }
                 }
             }
@@ -267,6 +271,7 @@ mod tests {
         fsys::InputFilter,
         key::{MouseButton::*, MouseEvent, MouseEventKind::*, MouseMod::*},
         log::LogBuffer,
+        ui::Ui,
     };
     use ad_event::{FsysEvent, Kind, Source};
     use simple_test_case::test_case;
@@ -675,7 +680,7 @@ mod tests {
         );
         ed.update_window_size(100, 80); // Needed in order to keep clicks in bounds
         ed.layout
-            .open_virtual("test", "some text to test with", false);
+            .open_virtual("test", "some text to test with", &mut Ui::Headless, false);
         ed.layout.active_buffer_mut().dot = Dot::Cur { c: Cur { idx: 5 } };
 
         // attach an input filter so we can intercept load and execute events

@@ -133,6 +133,9 @@ where
     pub(crate) fn update_window_size(&mut self, screen_rows: usize, screen_cols: usize) {
         trace!("window size updated: rows={screen_rows} cols={screen_cols}");
         self.layout.update_screen_size(screen_rows - 2, screen_cols);
+        self.ui.state_change(StateChange::WindowsResized {
+            winids: self.layout.visible_winids().collect(),
+        });
     }
 
     /// Ensure that opening without any files initialises the fsys state correctly
@@ -162,10 +165,14 @@ where
     }
 
     pub(super) fn refresh_screen_w_minibuffer(&mut self, mb: Option<MiniBufferState<'_>>) {
-        self.layout.clamp_scroll();
-        self.ui.refresh(
+        if self.layout.clamp_scroll() {
+            let winid = self.layout.active_window_id();
+            self.ui
+                .state_change(StateChange::WindowBufferChanged { winid });
+        }
+        self.layout.refresh_ui(
+            &mut self.ui,
             &self.modes[0].name,
-            &self.layout,
             &self.pending_keys,
             self.held_click.as_ref(),
             mb,
@@ -307,7 +314,8 @@ where
             }),
 
             AppendOutput { id, s } => {
-                self.layout.write_output_for_buffer(id, s, &self.cwd);
+                self.layout
+                    .write_output_for_buffer(id, s, &self.cwd, &mut self.ui);
                 default_handled();
             }
 
@@ -363,9 +371,10 @@ where
         use Action::*;
 
         match action {
-            AppendToOutputBuffer { bufid, content } => self
-                .layout
-                .write_output_for_buffer(bufid, content, &self.cwd),
+            AppendToOutputBuffer { bufid, content } => {
+                self.layout
+                    .write_output_for_buffer(bufid, content, &self.cwd, &mut self.ui)
+            }
             ChangeDirectory { path } => self.change_directory(path),
             CommandMode => self.command_mode(),
             DeleteBuffer { force } => self.delete_buffer(self.active_buffer_id(), force),
@@ -373,16 +382,36 @@ where
             DeleteWindow { force } => self.delete_active_window(force),
             DragWindow {
                 direction: Arrow::Up,
-            } => self.layout.drag_up(),
+            } => {
+                self.layout.drag_up();
+                self.ui.state_change(StateChange::WindowsResized {
+                    winids: self.layout.visible_winids().collect(),
+                });
+            }
             DragWindow {
                 direction: Arrow::Down,
-            } => self.layout.drag_down(),
+            } => {
+                self.layout.drag_down();
+                self.ui.state_change(StateChange::WindowsResized {
+                    winids: self.layout.visible_winids().collect(),
+                });
+            }
             DragWindow {
                 direction: Arrow::Left,
-            } => self.layout.drag_left(),
+            } => {
+                self.layout.drag_left();
+                self.ui.state_change(StateChange::WindowsResized {
+                    winids: self.layout.visible_winids().collect(),
+                });
+            }
             DragWindow {
                 direction: Arrow::Right,
-            } => self.layout.drag_right(),
+            } => {
+                self.layout.drag_right();
+                self.ui.state_change(StateChange::WindowsResized {
+                    winids: self.layout.visible_winids().collect(),
+                });
+            }
             EditCommand { cmd } => self.execute_edit_command(&cmd),
             ExecuteDot => self.default_execute_dot(None, source),
             ExecuteString { s } => self.execute_explicit_string(self.active_buffer_id(), s, source),
@@ -396,10 +425,20 @@ where
             LoadDot { new_window } => self.default_load_dot(source, new_window),
             MarkClean { bufid } => self.mark_clean(bufid),
             NewEditLogTransaction => self.layout.active_buffer_mut().new_edit_log_transaction(),
-            NewColumn => self.layout.new_column(),
-            NewWindow => self.layout.new_window(),
+            NewColumn => {
+                self.layout.new_column();
+                self.ui.state_change(StateChange::WindowsResized {
+                    winids: self.layout.visible_winids().collect(),
+                });
+            }
+            NewWindow => {
+                self.layout.new_window();
+                self.ui.state_change(StateChange::WindowsResized {
+                    winids: self.layout.visible_winids().collect(),
+                });
+            }
             NextBuffer => {
-                let id = self.layout.focus_next_buffer();
+                let id = self.layout.focus_next_buffer(&mut self.ui);
                 _ = self.tx_fsys.send(LogEvent::Focus(id));
             }
             NextColumn => {
@@ -413,10 +452,15 @@ where
                 _ = self.tx_fsys.send(LogEvent::Focus(id));
             }
             OpenFile { path } => self.open_file_relative_to_cwd(&path, false),
-            OpenFileInNewWindow { path } => self.open_file_relative_to_cwd(&path, true),
+            OpenFileInNewWindow { path } => {
+                self.open_file_relative_to_cwd(&path, true);
+                self.ui.state_change(StateChange::WindowsResized {
+                    winids: self.layout.visible_winids().collect(),
+                });
+            }
             Paste => self.paste_from_clipboard(source),
             PreviousBuffer => {
-                let id = self.layout.focus_previous_buffer();
+                let id = self.layout.focus_previous_buffer(&mut self.ui);
                 _ = self.tx_fsys.send(LogEvent::Focus(id));
             }
             PreviousColumn => {
@@ -473,13 +517,13 @@ where
     }
 
     fn jump_forward(&mut self) {
-        if let Some(id) = self.layout.jump_forward() {
+        if let Some(id) = self.layout.jump_forward(&mut self.ui) {
             _ = self.tx_fsys.send(LogEvent::Focus(id));
         }
     }
 
     fn jump_backward(&mut self) {
-        if let Some(id) = self.layout.jump_backward() {
+        if let Some(id) = self.layout.jump_backward(&mut self.ui) {
             _ = self.tx_fsys.send(LogEvent::Focus(id));
         }
     }

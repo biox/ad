@@ -215,6 +215,12 @@ impl Buffers {
         &mut self.inner.focus
     }
 
+    pub(crate) fn clear_modified_from(&mut self) {
+        for (_, b) in self.inner.iter_mut() {
+            b.modified_from = None;
+        }
+    }
+
     pub fn record_jump_position(&mut self) {
         self.jump_list
             .push(self.inner.focus.id, self.inner.focus.dot.active_cur());

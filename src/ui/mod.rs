@@ -46,19 +46,10 @@ pub(crate) trait UserInterface {
 /// to the editor state can be requested through the `provide_buf_reqs` method.
 #[derive(Debug, Clone)]
 pub(crate) enum StateChange {
-    // /// The active buffer has been updated
-    // ActiveBuffer { id: usize },
-    // /// The given buffer has been closed
-    // BufferClosed { id: usize },
-    // /// A new buffer has been opened.
-    // /// If replace_active is true then the user wants to replace the active buffer
-    // /// with the id specified, if it is false then they want to open a new UI
-    // /// window to contain the buffer.
-    // BufferOpen { id: usize, replace_active: bool },
-    // /// The given buffer has had its contents modified in some way
-    // BufferModified { id: usize },
-    // /// The dot for the given buffer has been updated
-    // BufferDotUpdated { id: usize },
+    /// The visible buffer in the given window has changed
+    WindowBufferChanged { winid: usize },
+    /// The given set of windows have been resized
+    WindowsResized { winids: Vec<usize> },
     /// User level config has been modified in some way
     ConfigUpdated,
     // /// The tag for the given buffer has been updated
